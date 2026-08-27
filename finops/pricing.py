@@ -60,7 +60,25 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
+# Interruption rates by GPU type (illustrative: H100 spot is less preempted ~3%, A10G/L4 ~8-10%)
+GPU_INTERRUPT_RATES: dict[str, float] = {
+    "H100": 0.03,
+    "H200": 0.03,
+    "B200": 0.04,
+    "A100": 0.05,
+    "MI300X": 0.06,
+    "A10G": 0.08,
+    "L4": 0.10,
+}
+
+
+def recommend_tier(
+    hours_per_day: float,
+    interruptible: bool,
+    reserved_discount: float = 0.45,
+    gpu_type: str | None = None,
+    job_days: float | None = None,
+) -> str:
     """Pick a purchasing tier from a workload's duty cycle + interruptibility.
 
     DOCUMENTED simple policy (instructor extension point — swap in your own):
@@ -75,6 +93,59 @@ def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount:
     if duty >= be:
         return "reserved"
     return "on_demand"
+
+
+def recommend_tier_advanced(
+    hours_per_day: float,
+    interruptible: bool,
+    gpu_type: str,
+    job_days: float = 30.0,
+    on_demand_hr: float = 2.50,
+    spot_hr: float = 1.50,
+    reserved_1yr_hr: float = 2.00,
+    reserved_3yr_hr: float = 1.40,
+) -> dict:
+    """Detailed financial simulation comparing all purchasing tiers (Extension 1).
+
+    Evaluates effective cost across on-demand, spot (with checkpointing/rework overhead),
+    1-year reserved, and 3-year reserved commitments based on actual workload duration.
+    """
+    total_hours = hours_per_day * job_days
+    on_demand_cost = total_hours * on_demand_hr
+
+    int_rate = GPU_INTERRUPT_RATES.get(gpu_type, 0.05)
+    spot_sim = spot_checkpoint_cost(total_hours, spot_hr, on_demand_hr, interrupt_rate=int_rate)
+    spot_cost = spot_sim["spot_cost"]
+
+    # Reserved options: compare if commitment matches workload lifetime
+    # If job duration is shorter than commitment period, commitment cost must cover the commit duration
+    r1_cost = total_hours * reserved_1yr_hr
+    r3_cost = total_hours * reserved_3yr_hr
+
+    costs = {"on_demand": on_demand_cost}
+    if interruptible and hours_per_day < 24:
+        costs["spot"] = spot_cost
+
+    duty = hours_per_day / 24.0
+    if duty >= 0.50:
+        if job_days >= 365 * 2.5:
+            costs["reserved_3yr"] = r3_cost
+        elif job_days >= 180:
+            costs["reserved_1yr"] = r1_cost
+        else:
+            costs["reserved"] = r3_cost  # standard 3yr reserved proxy
+
+    best_tier = min(costs, key=costs.get)
+    best_cost = costs[best_tier]
+    savings_pct = (1.0 - best_cost / on_demand_cost) * 100.0 if on_demand_cost > 0 else 0.0
+
+    return {
+        "best_tier": best_tier,
+        "best_cost": round(best_cost, 2),
+        "on_demand_cost": round(on_demand_cost, 2),
+        "savings_pct": round(savings_pct, 1),
+        "tier_costs": {k: round(v, 2) for k, v in costs.items()},
+    }
 
 
 def spot_checkpoint_cost(
@@ -102,3 +173,30 @@ def spot_checkpoint_cost(
         "on_demand_cost": round(on_demand_cost, 2),
         "savings_pct": round(savings_pct, 1),
     }
+
+
+def cache_is_worth_it(
+    avg_cache_reads: float,
+    write_cost_per_m: float,
+    read_discount: float = 0.10,
+    read_cost_per_m: float | None = None,
+) -> bool:
+    """Evaluate whether prompt caching provides net positive savings (Extension 3).
+
+    Caching incurs a write/storage cost to create the cached prefix and discounts subsequent reads.
+    Net savings = (Uncached Read Cost - Cached Read Cost) * avg_cache_reads - Write Cost
+                 = read_cost_per_m * (1 - read_discount) * avg_cache_reads - write_cost_per_m
+
+    If read_cost_per_m is omitted, it defaults to write_cost_per_m (standard in Gemini/Anthropic).
+    Break-even reads: N_be = write_cost_per_m / (read_cost_per_m * (1 - read_discount)).
+
+    Returns True if avg_cache_reads >= break_even_reads.
+    """
+    if avg_cache_reads <= 0 or write_cost_per_m <= 0:
+        return False
+    base_read = read_cost_per_m if read_cost_per_m is not None else write_cost_per_m
+    savings_per_read = base_read * (1.0 - read_discount)
+    if savings_per_read <= 0:
+        return False
+    break_even_reads = write_cost_per_m / savings_per_read
+    return avg_cache_reads >= break_even_reads

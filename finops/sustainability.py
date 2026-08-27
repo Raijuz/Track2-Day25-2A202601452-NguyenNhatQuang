@@ -45,3 +45,4 @@ def tokens_per_watt(total_tokens: int, wh: float, seconds: float = 1.0) -> float
     """Energy efficiency of serving: tokens per watt (higher is better)."""
     watts = (wh * 3600.0) / seconds if seconds > 0 else 0.0
     return total_tokens / watts if watts > 0 else 0.0
+

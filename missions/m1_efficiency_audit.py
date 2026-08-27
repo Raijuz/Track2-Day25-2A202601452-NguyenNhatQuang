@@ -46,6 +46,44 @@ def run(verbose: bool = True) -> dict:
         on_demand = num(catalog_by_type()[s["gpu_type"]]["on_demand_hr"])
         idle_waste += metrics.idle_waste_usd(s["idle_hours"], on_demand)
 
+    # Extension 2: MBU Right-sizing recommendations (local logic in M1)
+    mbu_suggestions = []
+    for r in summary:
+        gtype = r["gpu_type"]
+        mbu = float(r.get("mbu", 0))
+        cur_cost = num(cat[gtype]["on_demand_hr"])
+        cur_bw = num(cat[gtype]["peak_bw_tbs"])
+        cur_vram = num(cat[gtype]["hbm_gb"])
+        achieved_bw = mbu * cur_bw
+
+        # Compare with other GPU types in catalog
+        candidates = []
+        for alt_type, alt_specs in cat.items():
+            alt_cost = num(alt_specs["on_demand_hr"])
+            alt_bw = num(alt_specs["peak_bw_tbs"])
+            alt_vram = num(alt_specs["hbm_gb"])
+            if alt_cost < cur_cost and alt_bw >= achieved_bw:
+                savings_hr = cur_cost - alt_cost
+                candidates.append({
+                    "suggested_gpu": alt_type,
+                    "hourly_savings": round(savings_hr, 2),
+                    "savings_pct": round((savings_hr / cur_cost) * 100, 1),
+                    "target_mbu": round(achieved_bw / alt_bw, 3) if alt_bw > 0 else 0.0,
+                    "vram_gb": alt_vram,
+                })
+        if candidates:
+            best = max(candidates, key=lambda x: x["hourly_savings"])
+            mbu_suggestions.append({
+                "gpu_id": r["gpu_id"],
+                "current_type": gtype,
+                "current_mbu": mbu,
+                "suggested_type": best["suggested_gpu"],
+                "target_mbu": best["target_mbu"],
+                "hourly_savings": best["hourly_savings"],
+                "savings_pct": best["savings_pct"],
+                "monthly_savings": round(best["hourly_savings"] * 24 * 30, 2),
+            })
+
     if verbose:
         print("== M1 Efficiency Audit ==")
         print(f"{'GPU':14}{'type':7}{'util%':>7}{'MFU':>7}{'MBU':>7}{'idle_h':>8}")
@@ -54,7 +92,20 @@ def run(verbose: bool = True) -> dict:
         print(f"\nGPU-Util LIES (util>=90% but MFU<30%): {[l['gpu_id'] for l in lies]}")
         print(f"Idle waste (1 day): ${idle_waste:,.2f}  ->  ${idle_waste*30:,.0f}/month")
 
-    return {"summary": summary, "lies": lies, "idle_waste_daily": round(idle_waste, 2)}
+        if mbu_suggestions:
+            print("\n-- [Extension 2] MBU Right-Sizing Recommendations --")
+            print(f"{'GPU':14}{'Current':9}{'MBU':>6}{'Suggest':9}{'Tgt MBU':>8}{'Save/hr':>9}{'Save/mo':>10}")
+            for sug in mbu_suggestions:
+                print(f"{sug['gpu_id']:14}{sug['current_type']:9}{sug['current_mbu']:>6.3f}"
+                      f"{sug['suggested_type']:9}{sug['target_mbu']:>8.3f}"
+                      f"${sug['hourly_savings']:>7.2f} ${sug['monthly_savings']:>8.2f}")
+
+    return {
+        "summary": summary,
+        "lies": lies,
+        "idle_waste_daily": round(idle_waste, 2),
+        "mbu_suggestions": mbu_suggestions,
+    }
 
 
 if __name__ == "__main__":

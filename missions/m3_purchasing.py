@@ -43,6 +43,41 @@ def run(verbose: bool = True) -> dict:
     savings = on_demand_monthly - optimized_monthly
     savings_pct = savings / on_demand_monthly * 100 if on_demand_monthly else 0.0
 
+    # Extension 5: Carbon-aware scheduling for interruptible workloads (local implementation)
+    from finops.sustainability import REGION_CARBON, REGION_PRICE_KWH
+    base_region, green_region = "us-east-1", "europe-north1"
+    base_carbon_total_g = green_carbon_total_g = 0.0
+    base_energy_cost_total = green_energy_cost_total = 0.0
+    interruptible_jobs = []
+
+    for j in jobs:
+        if bool(int(num(j["interruptible"]))):
+            gtype = j["gpu_type"]
+            ngpu = int(num(j["num_gpus"]))
+            hpd = num(j["hours_per_day"])
+            days = num(j.get("days", 30))
+            watts = num(cat[gtype]["watts"])
+            total_kwh = (hpd * days * ngpu * watts) / 1000.0
+
+            base_c = total_kwh * REGION_CARBON.get(base_region, 380)
+            green_c = total_kwh * REGION_CARBON.get(green_region, 30)
+            base_e = total_kwh * REGION_PRICE_KWH.get(base_region, 0.12)
+            green_e = total_kwh * REGION_PRICE_KWH.get(green_region, 0.09)
+
+            base_carbon_total_g += base_c
+            green_carbon_total_g += green_c
+            base_energy_cost_total += base_e
+            green_energy_cost_total += green_e
+
+            interruptible_jobs.append({
+                "job_id": j["job_id"], "gpu_type": gtype, "kwh": round(total_kwh, 1),
+                "saved_carbon_kg": round((base_c - green_c) / 1000.0, 2),
+            })
+
+    carbon_saved_kg = (base_carbon_total_g - green_carbon_total_g) / 1000.0
+    carbon_reduction_pct = (carbon_saved_kg / (base_carbon_total_g / 1000.0) * 100) if base_carbon_total_g else 0.0
+    energy_cost_saved = base_energy_cost_total - green_energy_cost_total
+
     if verbose:
         print("== M3 Purchasing Strategy ==")
         print(f"break-even utilization @ 45% reserved discount = {pricing.break_even_utilization(0.45):.0%}")
@@ -51,8 +86,21 @@ def run(verbose: bool = True) -> dict:
             print(f"{r['job_id']:18}{r['gpu_type']:7}{r['tier']:11}${r['on_demand']:>11,}${r['optimized']:>11,}")
         print(f"\nmonthly: on-demand ${on_demand_monthly:,.0f} -> optimized ${optimized_monthly:,.0f}  ({savings_pct:.1f}% saved)")
 
-    return {"recommendations": recs, "on_demand_monthly": round(on_demand_monthly),
-            "optimized_monthly": round(optimized_monthly), "savings_pct": round(savings_pct, 1)}
+        print("\n-- [Extension 5] Carbon-Aware Scheduling (us-east-1 -> europe-north1) --")
+        print(f"Baseline Carbon: {base_carbon_total_g/1000.0:,.1f} kg CO2e  |  "
+              f"Green Carbon: {green_carbon_total_g/1000.0:,.1f} kg CO2e  |  "
+              f"Saved: {carbon_saved_kg:,.1f} kg CO2e ({carbon_reduction_pct:.1f}%)")
+        print(f"Electricity cost saved: ${energy_cost_saved:,.2f}")
+
+    return {
+        "recommendations": recs,
+        "on_demand_monthly": round(on_demand_monthly),
+        "optimized_monthly": round(optimized_monthly),
+        "savings_pct": round(savings_pct, 1),
+        "carbon_saved_kg": round(carbon_saved_kg, 2),
+        "carbon_reduction_pct": round(carbon_reduction_pct, 1),
+        "energy_cost_saved_usd": round(energy_cost_saved, 2),
+    }
 
 
 if __name__ == "__main__":
